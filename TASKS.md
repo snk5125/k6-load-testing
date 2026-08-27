@@ -22,13 +22,73 @@ docker push <acct>.dkr.ecr.<region>.amazonaws.com/k6-loadgen:v1
 
 ## 2. Generator cluster + task def
 
+**2a. Cluster** (with Container Insights so generator CPU is visible — the <80% guard):
 ```bash
-aws ecs create-cluster --cluster-name <gen-cluster>
+aws ecs create-cluster --cluster-name <gen-cluster> \
+  --settings name=containerInsights,value=enabled
 ```
-Task def (`k6-taskdef.json`): Fargate, `cpu: 4096`, `memory: 8192`, networkMode awsvpc, image from step 1, env vars `TARGET_URL`, `SCENARIO`, `RUN_ID`, `KNEE_EPS` (override per run via `--overrides`). Use Vector's VPC subnets + a security group allowed to reach the ALB.
+
+**2b. Log group** (k6 output — summaries and FAILED_SEQ lines — lands here):
+```bash
+aws logs create-log-group --log-group-name /ecs/k6-loadgen
+aws logs put-retention-policy --log-group-name /ecs/k6-loadgen --retention-in-days 30
+```
+
+**2c. IAM.** Two roles:
+- **Execution role** (required): pulls the image + writes logs. Reuse an existing
+  `ecsTaskExecutionRole` with the AWS-managed `AmazonECSTaskExecutionRolePolicy`,
+  or create one with that policy and trust `ecs-tasks.amazonaws.com`.
+- **Task role** (not needed): the k6 container calls no AWS APIs. Omit.
+
+**2d. Security group** for the generator:
+```bash
+aws ec2 create-security-group --group-name k6-loadgen-sg \
+  --description "k6 generator egress to Vector NLB" --vpc-id <vpc-id>
+# egress only; no ingress rules. Restrict egress to the Vector listener port:
+aws ec2 authorize-security-group-egress --group-id <sg-id> \
+  --protocol tcp --port <otlp-port> --cidr <vpc-cidr>
+```
+If Vector's own security group restricts sources, add an ingress rule there
+allowing `<sg-id>` on `<otlp-port>`.
+
+**2e. Task definition** — `k6-taskdef.json`:
+```json
+{
+  "family": "k6-loadgen",
+  "requiresCompatibilities": ["FARGATE"],
+  "networkMode": "awsvpc",
+  "cpu": "4096",
+  "memory": "8192",
+  "executionRoleArn": "arn:aws-us-gov:iam::<acct>:role/ecsTaskExecutionRole",
+  "containerDefinitions": [{
+    "name": "k6",
+    "image": "<acct>.dkr.ecr.<region>.amazonaws.com/k6-loadgen:v1",
+    "essential": true,
+    "environment": [
+      {"name": "TARGET_URL", "value": "https://<nlb-dns>:<otlp-port>"},
+      {"name": "SCENARIO",   "value": "sweep"},
+      {"name": "RUN_ID",     "value": "override-me"},
+      {"name": "KNEE_EPS",   "value": "5000"}
+    ],
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "/ecs/k6-loadgen",
+        "awslogs-region": "<region>",
+        "awslogs-stream-prefix": "k6"
+      }
+    }
+  }]
+}
+```
 ```bash
 aws ecs register-task-definition --cli-input-json file://k6-taskdef.json
 ```
+Notes: defaults in `environment` are placeholders — every real run overrides
+SCENARIO/RUN_ID/KNEE_EPS via `--overrides` (step 6/7). Subnets: use Vector's
+private subnets, `assignPublicIp=DISABLED` (image pull needs a NAT or ECR VPC
+endpoints — `com.amazonaws.<region>.ecr.api`, `.ecr.dkr`, plus S3 gateway —
+if the subnets have no NAT). GovCloud ARN partition is `arn:aws-us-gov:`.
 
 ## 3. Test Vector config
 
