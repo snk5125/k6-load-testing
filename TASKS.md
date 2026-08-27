@@ -11,9 +11,13 @@ COPY k6-vector-assessment.js /scripts/
 ENTRYPOINT ["k6","run","/scripts/k6-vector-assessment.js"]
 ```
 ```bash
-aws ecr get-login-password | docker login --username AWS --password-stdin <acct>.dkr.ecr.<region>.amazonaws.com
-docker build -t <acct>.dkr.ecr.<region>.amazonaws.com/<existing-repo>:k6-loadgen-v1 .
-docker push <acct>.dkr.ecr.<region>.amazonaws.com/<existing-repo>:k6-loadgen-v1
+# create the repo (once)
+aws ecr create-repository --repository-name k6-loadgen \
+  --image-scanning-configuration scanOnPush=true --region <region>
+# authenticate docker to ECR, build, push
+aws ecr get-login-password --region <region> | docker login --username AWS --password-stdin <acct>.dkr.ecr.<region>.amazonaws.com
+docker build -t <acct>.dkr.ecr.<region>.amazonaws.com/k6-loadgen:v1 .
+docker push <acct>.dkr.ecr.<region>.amazonaws.com/k6-loadgen:v1
 ```
 
 ## 2. Generator cluster + task def
