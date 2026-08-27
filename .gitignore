@@ -1,0 +1,29 @@
+# macOS
+.DS_Store
+.AppleDouble
+._*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Test outputs — run artifacts stay local, not in the repo
+summary-*.json
+timeline.csv
+events.jsonl
+failed.txt
+*.log
+
+# Secrets / env — never commit credentials or live endpoints
+.env
+*.pem
+*.key
+credentials*
+vector-test.yaml
+
+# Editors
+.vscode/
+.idea/
+*.swp
+_to_delete/
