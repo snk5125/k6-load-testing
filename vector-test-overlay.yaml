@@ -1,0 +1,123 @@
+# Vector test overlay — merge into the aggregator config for the assessment.
+#
+# PART 1 = measurement only (safe for baseline; does not change behavior).
+# PART 2 = candidate fixes. Do NOT apply for baseline runs — baseline measures
+#          the system as-is. Apply selectively for re-runs per the runbook matrix.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PART 1 — OBSERVABILITY (apply before baseline)
+# ─────────────────────────────────────────────────────────────────────────────
+
+sources:
+  internal:
+    type: internal_metrics
+    # default scrape interval is fine
+
+sinks:
+  prom_exporter:
+    type: prometheus_exporter
+    inputs: [internal]
+    address: 0.0.0.0:9598
+    # Reach it per-task via ECS Exec:
+    #   aws ecs execute-command ... --command \
+    #     "sh -c 'wget -qO- localhost:9598 | grep -E \"buffer_(byte_size|events)|discarded|component_(sent|received)_events_total\"'"
+    # Metrics that matter:
+    #   vector_buffer_byte_size{component_id="Splunk"}      backlog (per THIS task)
+    #   vector_buffer_events
+    #   vector_component_discarded_events_total             Vector admitting loss
+    #   vector_component_received_events_total (otel src)   vs k6 confirmed_events
+    #   vector_component_sent_events_total (Splunk sink)    vs Splunk row count
+
+# Finding #9 remediation candidate — per-task metric dimension. If Sink A
+# (aws_cloudwatch_metrics) is fed from internal metrics, add a remap before it:
+#
+# transforms:
+#   tag_task:
+#     type: remap
+#     inputs: [internal]
+#     source: |
+#       .tags.task_id = get_env_var!("ECS_TASK_ID")   # inject via container env
+#       # entrypoint: export ECS_TASK_ID=$(wget -qO- $ECS_CONTAINER_METADATA_URI_V4/task | ...)
+#
+# Then alarm scale-OUT on Maximum across task_id, not Average (see runbook P6).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PART 2 — CANDIDATE FIXES (re-run variants only; one at a time)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# FIX-A (finding #3): make 200 mean "durably buffered"
+# acknowledgements:
+#   enabled: true
+# NOTE: with a disk-buffered sink, acks fire on buffer WRITE, not Splunk
+# delivery. On Fargate the disk dies with the task, so acked-but-undrained
+# data still needs the sequence check. Acks close the ingest-side gap only.
+
+# FIX-B (finding #2): survivable shutdown drain
+# In the TASK DEFINITION (not this file):
+#   containerDefinitions[].stopTimeout: 120
+#   command: [..., "--graceful-shutdown-limit-secs", "110"]
+# And shrink the buffer to what 110s can drain (measured Splunk MB/s x 110):
+# sinks:
+#   Splunk:
+#     buffer:
+#       type: disk
+#       max_size: 3221225472   # example: 3 GiB @ ~30 MB/s drain
+#       when_full: block
+
+# FIX-C (finding #5): stop the CloudWatch metrics sink from stalling ingest
+# sinks:
+#   <sink_a_name>:
+#     buffer:
+#       type: memory
+#       max_events: 10000
+#       when_full: drop_newest   # losing derived metrics under overload is
+#                                # acceptable; stalling log ingest is not
+
+# FIX-D (finding #7): alarm-side, not Vector-side
+#   aws cloudwatch put-metric-alarm ... --treat-missing-data breaching
+#   (scale-OUT alarm only; leave scale-in at 'missing')
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PART 3 — BLACKHOLE TEST SINKS (knee decomposition + scaling runs)
+# Replace the real Splunk sink with ONE of these per run. Keep the sink NAME
+# "Splunk" so the buffer_byte_size CloudWatch dimension (component_id=Splunk)
+# and the production alarms keep working unchanged. Keep Sink A + the
+# noteworthy filter in place.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# KNEE RUN 1 — pure processing ceiling (no buffer block = memory default;
+# also demonstrates that the buffer-based scale-out alarm can never fire)
+# sinks:
+#   Splunk:
+#     type: blackhole
+#     inputs: [<same as real sink>]
+
+# KNEE RUN 2 — production buffer path (EFS tax): same, plus the real buffer
+# block copied verbatim:
+#   Splunk:
+#     type: blackhole
+#     inputs: [<same>]
+#     buffer: { type: disk, max_size: 10737418240, when_full: block }
+# (KNEE RUN 3 = same config, task def swapped to ephemeral mount — the
+#  /vector-data-dir EFS volume removed so data_dir falls to local disk.)
+
+# SCALING RUNS — deterministic "slow Splunk": rate caps the sink in
+# events/sec PER TASK. Set to ~50-70% of measured knee EPS so backlog grows
+# on demand and the alarm/ladder can be exercised repeatably.
+#   Splunk:
+#     type: blackhole
+#     rate: 40000            # <- tune to your knee
+#     inputs: [<same>]
+#     buffer: { type: disk, max_size: 10737418240, when_full: block }
+# NOTE: rate is per task, so scale-out DOES add drain capacity in this
+# simulation — it cannot reproduce the shared-Splunk "scale-out adds nothing"
+# mode. Loss accounting without a real sink: received_events − sent_events
+# per task (prometheus), cross-checked against k6 counters.
+
+# FIX-E (findings #6/#9): scale-in safety
+#   - ECS task scale-in protection while buffer non-empty (Vector-on-ECS
+#     pattern): task sets protectionEnabled=true via ECS agent endpoint when
+#     vector_buffer_byte_size > 0, clears when drained.
+#   - And/or composite scale-out alarm: CPU > 65% OR buffer > threshold
+#     (closes the finding-#1 blind spot: buffer metric cannot see a
+#     Vector-CPU bottleneck).
