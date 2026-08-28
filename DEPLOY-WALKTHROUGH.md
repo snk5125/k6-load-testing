@@ -29,7 +29,11 @@ aws logs create-log-group --log-group-name /ecs/k6-loadgen
 
 ## 2d. Security group
 ```bash
-aws ec2 create-security-group --group-name k6-loadgen-sg --vpc-id <vpc-id> ...
+aws ec2 create-security-group --group-name k6-loadgen-sg \
+  --description "k6 generator egress to Vector NLB" --vpc-id <vpc-id>
+# note the returned GroupId -> <k6-sg-id>
+aws ec2 authorize-security-group-egress --group-id <k6-sg-id> \
+  --protocol tcp --port <otlp-port> --cidr <vpc-cidr>
 ```
 - Consumes the VPC ID (only place it's named explicitly — SGs are VPC-scoped).
 - Egress-only rule to `<otlp-port>`; no ingress (generator only initiates).
