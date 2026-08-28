@@ -180,11 +180,15 @@ aws ecs run-task --cluster <gen-cluster> --launch-type FARGATE \
   --task-definition k6-loadgen --network-configuration "$NETCFG" \
   --overrides '{"containerOverrides":[{"name":"k6","command":["run","--iterations","1","/scripts/k6-vector-assessment.js"],"environment":[{"name":"TARGET_URL","value":"https://<nlb-dns>:<otlp-port>"},{"name":"RUN_ID","value":"smoke-1"},{"name":"SCENARIO","value":"sweep"}]}]}'
 
+# per-task metrics: curl the task IP directly from an in-VPC host
+# (requires 9598 ingress on Vector's SG from that host's SG)
 TASK=$(aws ecs list-tasks --cluster <vector-cluster> --service-name <vector-svc> --query 'taskArns[0]' --output text)
-aws ecs execute-command --cluster <vector-cluster> --task $TASK --container vector \
-  --interactive --command "sh -c 'wget -qO- localhost:9598 | grep -E \"received_events_total|sent_events_total\"'"
+IP=$(aws ecs describe-tasks --cluster <vector-cluster> --tasks $TASK \
+  --query "tasks[0].attachments[0].details[?name=='privateIPv4Address'].value" --output text)
+curl -s http://$IP:9598/metrics | grep -E 'received_events_total|sent_events_total'
 ```
 Expect: received=100, sent(Splunk)=100 (or ×PASS_RATIO).
+(Fallback if no in-VPC host: ECS Exec into the task and wget localhost:9598/metrics.)
 
 ## 7. Sweep 2.1 (no buffer)
 
@@ -275,7 +279,9 @@ aws application-autoscaling describe-scaling-activities --service-namespace ecs 
 
 ## 18. Kill test
 
-During plateau (`SCENARIO=plateau`), find loaded task via 9598 `buffer_byte_size`, then:
+During plateau (`SCENARIO=plateau`), curl EACH task's IP for `buffer_byte_size`
+(`curl -s http://<task-ip>:9598/metrics | grep buffer_byte_size`), pick the
+loaded one, then:
 ```bash
 aws ecs stop-task --cluster <vector-cluster> --task <task-arn> --reason kill-test
 ```

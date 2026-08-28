@@ -24,7 +24,7 @@ k6 `splunk_bound_events` ≈ Vector `component_received_events_total` ≈ sink `
 
 ## Useful commands
 
-- Per-task metrics: ECS Exec → `wget -qO- localhost:9598 | grep -E 'buffer_byte_size|received_events|sent_events|discarded'`
+- Per-task metrics (from an in-VPC host; 9598 open on Vector SG): `curl -s http://<task-ip>:9598/metrics | grep -E 'buffer_byte_size|received_events|sent_events|discarded'` — task IP via `describe-tasks ... privateIPv4Address`. Fallback: ECS Exec + wget localhost.
 - Suspend/resume scaling: `aws application-autoscaling register-scalable-target ... --suspended-state DynamicScalingInSuspended=<bool>,DynamicScalingOutSuspended=<bool>`
 - Force alarm (control-plane dry run): `aws cloudwatch set-alarm-state --alarm-name <x> --state-value ALARM --state-reason test`
 - Kill test: `aws ecs stop-task --cluster <c> --task <t>` while its buffer is non-empty
