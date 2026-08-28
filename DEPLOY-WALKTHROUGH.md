@@ -1,5 +1,9 @@
 # Generator Deployment — Command Walkthrough
 
+> Numbering follows TASKS.md. Step 1 (ECR image build/push) precedes this
+> document; steps 3–5 (Vector-side test config) sit between 2e and 6.
+
+
 What each step consumes and why. Dependency chain:
 **VPC ID → SG (2d)** · **ECR push → image URI (2e)** · **2b + 2c → 2e** · **2a + 2d + 2e + NLB data → run-task**
 
