@@ -1,6 +1,24 @@
 # Task List with Commands
 
-Placeholders: `<acct>` account ID, `<region>` us-gov-west-1, `<cluster>` Vector's cluster, `<svc>` Vector service, `<gen-cluster>` generator cluster, `<fs-id>` EFS filesystem, `<alb-dns>` ALB endpoint.
+## 0. Prerequisites — gather BEFORE starting
+
+| # | What | Where to get it |
+|---|------|-----------------|
+| 1 | Private subnet IDs (2) | layer-00 remote state outputs |
+| 2 | VPC ID | layer-00 remote state |
+| 3 | NLB DNS name | `aws elbv2 describe-load-balancers` |
+| 4 | OTLP listener port | `aws elbv2 describe-listeners` |
+| 5 | TLS on listener? (https/http) | same as #4 |
+| 6 | Vector's security group ID | Vector service `networkConfiguration` |
+| 7 | Execution role ARN | `aws iam get-role --role-name ecsTaskExecutionRole` |
+| 8 | k6 image URI | ECR push (step 1) |
+| 9 | Generator cluster name (your choice) | — |
+| 10 | NAT or VPC endpoints in the subnets? | route tables for #1 |
+
+Blockers for first launch: 1, 3, 4, 6, 7. Fill these into the placeholders
+below before running any step.
+
+Placeholders: `<acct>` account ID, `<region>` us-gov-west-1, `<cluster>` Vector's cluster, `<svc>` Vector service, `<gen-cluster>` generator cluster, `<fs-id>` EFS filesystem, `<nlb-dns>`/`<otlp-port>` from #3/#4, `<vpc-id>`/subnets from #1/#2, `<k6-sg-id>` created in step 2d.
 
 ## 1. Build generator image
 
@@ -131,10 +149,16 @@ aws application-autoscaling register-scalable-target --service-namespace ecs \
 
 ## 6. Smoke test
 
+VPC placement happens HERE, not in the cluster or task definition: the
+subnet IDs in --network-configuration decide the VPC. Use Vector's private
+subnets so traffic to the NLB stays in-VPC. Reused for every run:
+
 ```bash
+NETCFG='awsvpcConfiguration={subnets=[subnet-aaa,subnet-bbb],securityGroups=[<k6-sg-id>],assignPublicIp=DISABLED}'
+
 aws ecs run-task --cluster <gen-cluster> --launch-type FARGATE \
-  --task-definition k6-loadgen --network-configuration '...' \
-  --overrides '{"containerOverrides":[{"name":"k6","command":["run","--iterations","1","/scripts/k6-vector-assessment.js"],"environment":[{"name":"TARGET_URL","value":"https://<alb-dns>"},{"name":"RUN_ID","value":"smoke-1"},{"name":"SCENARIO","value":"sweep"}]}]}'
+  --task-definition k6-loadgen --network-configuration "$NETCFG" \
+  --overrides '{"containerOverrides":[{"name":"k6","command":["run","--iterations","1","/scripts/k6-vector-assessment.js"],"environment":[{"name":"TARGET_URL","value":"https://<nlb-dns>:<otlp-port>"},{"name":"RUN_ID","value":"smoke-1"},{"name":"SCENARIO","value":"sweep"}]}]}'
 
 TASK=$(aws ecs list-tasks --cluster <cluster> --service-name <svc> --query 'taskArns[0]' --output text)
 aws ecs execute-command --cluster <cluster> --task $TASK --container vector \
@@ -145,7 +169,9 @@ Expect: received=100, sent(Splunk)=100 (or ×PASS_RATIO).
 ## 7. Sweep 2.1 (no buffer)
 
 ```bash
-aws ecs run-task ... --overrides '... "environment":[...,{"name":"SCENARIO","value":"sweep"},{"name":"RUN_ID","value":"sweep-2.1a"},{"name":"KNEE_EPS","value":"5000"}]'
+aws ecs run-task --cluster <gen-cluster> --launch-type FARGATE \
+  --task-definition k6-loadgen --network-configuration "$NETCFG" \
+  --overrides '{"containerOverrides":[{"name":"k6","environment":[{"name":"TARGET_URL","value":"https://<nlb-dns>:<otlp-port>"},{"name":"SCENARIO","value":"sweep"},{"name":"RUN_ID","value":"sweep-2.1a"},{"name":"KNEE_EPS","value":"5000"}]}]}'
 ```
 Watch: k6 summary p50/p99; task CPU (`aws cloudwatch get-metric-statistics --namespace ECS/ContainerInsights --metric-name CpuUtilized ...` or console); port-9598 metrics.
 Knee = step where p99 ≥ 2× idle p99. If knee at first/last step, halve/double KNEE_EPS, rerun (`sweep-2.1b`...). Record: knee EPS, CPU% at knee.
