@@ -18,7 +18,7 @@
 Blockers for first launch: 1, 3, 4, 6, 7. Fill these into the placeholders
 below before running any step.
 
-Placeholders: `<acct>` account ID, `<region>` us-gov-west-1, `<cluster>` Vector's cluster, `<svc>` Vector service, `<gen-cluster>` generator cluster, `<fs-id>` EFS filesystem, `<nlb-dns>`/`<otlp-port>` from #3/#4, `<vpc-id>`/subnets from #1/#2, `<k6-sg-id>` created in step 2d.
+Placeholders: `<acct>` account ID, `<region>` us-gov-west-1, `<vector-cluster>` the EXISTING cluster running Vector, `<vector-svc>` the existing Vector service in it, `<gen-cluster>` generator cluster, `<fs-id>` EFS filesystem, `<nlb-dns>`/`<otlp-port>` from #3/#4, `<vpc-id>`/subnets from #1/#2, `<k6-sg-id>` created in step 2d.
 
 ## 1. Build generator image
 
@@ -102,8 +102,10 @@ allowing `<sg-id>` on `<otlp-port>`.
 ```bash
 aws ecs register-task-definition --cli-input-json file://k6-taskdef.json
 ```
-Notes: defaults in `environment` are placeholders — every real run overrides
-SCENARIO/RUN_ID/KNEE_EPS via `--overrides` (step 6/7). The task definition
+Notes: --overrides replaces only the env vars it lists; unlisted ones fall
+back to task-def defaults. SCENARIO/RUN_ID/KNEE_EPS are per-run — always
+override them (RUN_ID must be unique every run). TARGET_URL is constant —
+bake the real value in here and omit it from overrides. The task definition
 contains NO networking: subnets/SG (and therefore VPC) are passed at launch
 time via --network-configuration — see step 6's NETCFG. GovCloud ARN
 partition is `arn:aws-us-gov:`.
@@ -134,16 +136,16 @@ aws s3 cp vector-test.yaml s3://<bucket>/<prefix>/vector-test.yaml
 Duplicate current task def; point config env/entrypoint at `vector-test.yaml`; ensure `enableExecuteCommand` on service.
 ```bash
 aws ecs register-task-definition --cli-input-json file://vector-test-taskdef.json
-aws ecs update-service --cluster <cluster> --service <svc> \
+aws ecs update-service --cluster <vector-cluster> --service <vector-svc> \
   --task-definition <family>:<new-rev> --enable-execute-command --force-new-deployment
 ```
 
 ## 5. Pin + suspend scaling
 
 ```bash
-aws ecs update-service --cluster <cluster> --service <svc> --desired-count 1
+aws ecs update-service --cluster <vector-cluster> --service <vector-svc> --desired-count 1
 aws application-autoscaling register-scalable-target --service-namespace ecs \
-  --resource-id service/<cluster>/<svc> --scalable-dimension ecs:service:DesiredCount \
+  --resource-id service/<vector-cluster>/<vector-svc> --scalable-dimension ecs:service:DesiredCount \
   --suspended-state DynamicScalingInSuspended=true,DynamicScalingOutSuspended=true
 ```
 
@@ -162,8 +164,8 @@ aws ecs run-task --cluster <gen-cluster> --launch-type FARGATE \
   --task-definition k6-loadgen --network-configuration "$NETCFG" \
   --overrides '{"containerOverrides":[{"name":"k6","command":["run","--iterations","1","/scripts/k6-vector-assessment.js"],"environment":[{"name":"TARGET_URL","value":"https://<nlb-dns>:<otlp-port>"},{"name":"RUN_ID","value":"smoke-1"},{"name":"SCENARIO","value":"sweep"}]}]}'
 
-TASK=$(aws ecs list-tasks --cluster <cluster> --service-name <svc> --query 'taskArns[0]' --output text)
-aws ecs execute-command --cluster <cluster> --task $TASK --container vector \
+TASK=$(aws ecs list-tasks --cluster <vector-cluster> --service-name <vector-svc> --query 'taskArns[0]' --output text)
+aws ecs execute-command --cluster <vector-cluster> --task $TASK --container vector \
   --interactive --command "sh -c 'wget -qO- localhost:9598 | grep -E \"received_events_total|sent_events_total\"'"
 ```
 Expect: received=100, sent(Splunk)=100 (or ×PASS_RATIO).
@@ -208,13 +210,13 @@ Deploy 1-container Fargate task: nginx with `return 200 '{"text":"Success","code
 
 ```bash
 aws application-autoscaling put-scaling-policy --service-namespace ecs \
-  --resource-id service/<cluster>/<svc> --scalable-dimension ecs:service:DesiredCount \
+  --resource-id service/<vector-cluster>/<vector-svc> --scalable-dimension ecs:service:DesiredCount \
   --policy-name cpu-scale-out --policy-type StepScaling \
   --step-scaling-policy-configuration '{"AdjustmentType":"ChangeInCapacity","Cooldown":60,"MetricAggregationType":"Average","StepAdjustments":[{"MetricIntervalLowerBound":0,"ScalingAdjustment":1}]}'
 # note returned PolicyARN
 aws cloudwatch put-metric-alarm --alarm-name vector-cpu-high \
   --namespace AWS/ECS --metric-name CPUUtilization \
-  --dimensions Name=ClusterName,Value=<cluster> Name=ServiceName,Value=<svc> \
+  --dimensions Name=ClusterName,Value=<vector-cluster> Name=ServiceName,Value=<vector-svc> \
   --statistic Average --period 60 --evaluation-periods 2 \
   --threshold 65 --comparison-operator GreaterThanThreshold \
   --treat-missing-data breaching --alarm-actions <PolicyARN>
@@ -233,7 +235,7 @@ aws elbv2 modify-target-group --target-group-arn <tg> \
 
 ```bash
 aws application-autoscaling register-scalable-target --service-namespace ecs \
-  --resource-id service/<cluster>/<svc> --scalable-dimension ecs:service:DesiredCount \
+  --resource-id service/<vector-cluster>/<vector-svc> --scalable-dimension ecs:service:DesiredCount \
   --min-capacity 2 --max-capacity 10 \
   --suspended-state DynamicScalingInSuspended=false,DynamicScalingOutSuspended=false
 ```
@@ -251,7 +253,7 @@ In S3 config: `rate: <0.5–0.7 × knee EPS>` on the blackhole sink (buffer bloc
 `SCENARIO=sawtooth`. Then:
 ```bash
 aws application-autoscaling describe-scaling-activities --service-namespace ecs \
-  --resource-id service/<cluster>/<svc> --max-results 50
+  --resource-id service/<vector-cluster>/<vector-svc> --max-results 50
 ```
 >~4 actions/hour on steady pattern = flapping.
 
@@ -259,14 +261,14 @@ aws application-autoscaling describe-scaling-activities --service-namespace ecs 
 
 During plateau (`SCENARIO=plateau`), find loaded task via 9598 `buffer_byte_size`, then:
 ```bash
-aws ecs stop-task --cluster <cluster> --task <task-arn> --reason kill-test
+aws ecs stop-task --cluster <vector-cluster> --task <task-arn> --reason kill-test
 ```
 Loss = that task's (received − sent) at kill; verify fleet totals vs k6 `splunk_bound_events`.
 
 ## 19. Evidence
 
 ```bash
-python3 build_timeline.py --cluster <cluster> --service <svc> \
+python3 build_timeline.py --cluster <vector-cluster> --service <vector-svc> \
   --alarms vector-cpu-high <buffer-alarms> --start <iso> --end <iso>
 ```
 Archive: `summary-<RUN_ID>.json`, timeline.csv, FAILED_SEQ greps, credit snapshots.
@@ -274,7 +276,7 @@ Archive: `summary-<RUN_ID>.json`, timeline.csv, FAILED_SEQ greps, credit snapsho
 ## 20. Teardown
 
 ```bash
-aws ecs update-service --cluster <cluster> --service <svc> --task-definition <family>:<prod-rev> --desired-count 2
+aws ecs update-service --cluster <vector-cluster> --service <vector-svc> --task-definition <family>:<prod-rev> --desired-count 2
 # restore original suspended-state; delete test alarms/policy if not keeping
 ```
 Snapshot BurstCreditBalance.
