@@ -103,10 +103,10 @@ allowing `<sg-id>` on `<otlp-port>`.
 aws ecs register-task-definition --cli-input-json file://k6-taskdef.json
 ```
 Notes: defaults in `environment` are placeholders — every real run overrides
-SCENARIO/RUN_ID/KNEE_EPS via `--overrides` (step 6/7). Subnets: use Vector's
-private subnets, `assignPublicIp=DISABLED` (image pull needs a NAT or ECR VPC
-endpoints — `com.amazonaws.<region>.ecr.api`, `.ecr.dkr`, plus S3 gateway —
-if the subnets have no NAT). GovCloud ARN partition is `arn:aws-us-gov:`.
+SCENARIO/RUN_ID/KNEE_EPS via `--overrides` (step 6/7). The task definition
+contains NO networking: subnets/SG (and therefore VPC) are passed at launch
+time via --network-configuration — see step 6's NETCFG. GovCloud ARN
+partition is `arn:aws-us-gov:`.
 
 ## 3. Test Vector config
 
@@ -151,7 +151,9 @@ aws application-autoscaling register-scalable-target --service-namespace ecs \
 
 VPC placement happens HERE, not in the cluster or task definition: the
 subnet IDs in --network-configuration decide the VPC. Use Vector's private
-subnets so traffic to the NLB stays in-VPC. Reused for every run:
+subnets so traffic to the NLB stays in-VPC; assignPublicIp=DISABLED means
+the image pull needs a NAT route or VPC endpoints (ecr.api, ecr.dkr, S3
+gateway, logs) in those subnets. NETCFG is reused for every run:
 
 ```bash
 NETCFG='awsvpcConfiguration={subnets=[subnet-aaa,subnet-bbb],securityGroups=[<k6-sg-id>],assignPublicIp=DISABLED}'
