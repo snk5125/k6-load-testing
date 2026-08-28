@@ -110,25 +110,41 @@ contains NO networking: subnets/SG (and therefore VPC) are passed at launch
 time via --network-configuration — see step 6's NETCFG. GovCloud ARN
 partition is `arn:aws-us-gov:`.
 
-## 3. Test Vector config
+## 3. Test Vector config (multi-file layout)
 
-Copy prod config; change only:
+Vector merges every file in its config dir; component names must be unique
+across files. The aggregator splits sources/sinks into separate files, so
+the test config is per-file edits, not one rewritten file:
+
+**a. Sinks file** — replace ONLY the Splunk sink's body, keeping its name
+(preserves the component_id=Splunk metric dimension and the alarms):
 ```yaml
 sinks:
-  Splunk:            # name unchanged — keeps component_id=Splunk metrics/alarms
+  Splunk:
     type: blackhole
-    inputs: [<same inputs as prod Splunk sink>]
-    # no buffer block for run 2.1
+    inputs: [<same inputs as the prod Splunk sink>]
+    # no buffer block for run 2.1; add the prod buffer block for 2.2/2.3
+```
+
+**b. New file `observability.yaml`** — additive, touches nothing else:
+```yaml
 sources:
-  internal: { type: internal_metrics }
+  internal:
+    type: internal_metrics
 sinks:
   prom_exporter:
     type: prometheus_exporter
     inputs: [internal]
     address: 0.0.0.0:9598
 ```
+
+**c. All other files (sources, transforms/filter) unchanged** — the
+noteworthy filter and the from_otel source stay exactly as prod.
+
+Stage the test set under its own S3 prefix so prod and test configs can
+never be confused, and point the test task-def revision at it:
 ```bash
-aws s3 cp vector-test.yaml s3://<bucket>/<prefix>/vector-test.yaml
+aws s3 sync ./vector-test-config/ s3://<bucket>/<test-prefix>/
 ```
 
 ## 4. Deploy test revision
@@ -182,7 +198,7 @@ Knee = step where p99 ≥ 2× idle p99. If knee at first/last step, halve/double
 
 ## 8. Sweep 2.2 (EFS buffer)
 
-Add to blackhole sink in S3 config, redeploy service (force-new-deployment):
+In the SINKS file, add to the blackhole sink, re-sync to the test prefix, redeploy (force-new-deployment):
 ```yaml
     buffer: { type: disk, max_size: 10737418240, when_full: block }
 ```
